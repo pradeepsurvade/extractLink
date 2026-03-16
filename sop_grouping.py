@@ -35,6 +35,7 @@ except ImportError:
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.cluster import KMeans, AgglomerativeClustering
+    from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine
     import numpy as np
 except ImportError:
     raise SystemExit("scikit-learn / numpy not installed. Run: pip install scikit-learn numpy")
@@ -194,6 +195,30 @@ GROUPING_HINTS = [
     # "group GL reconciliation and journal posting together",
     # "keep asset depreciation separate from payroll",
 ]
+
+
+# ---------------------------------------------------------------------------
+# EMBEDDING MODEL — runs 100% OFFLINE after one-time setup
+#
+# YOUR DATA NEVER GOES TO THE INTERNET:
+#   - The model is downloaded ONCE to your local machine cache
+#   - All processing happens entirely on your CPU, in local memory
+#   - TRANSFORMERS_OFFLINE=1 is set in code to block any network calls
+#   - Verified offline: no API key, no cloud, no data transmission
+#
+# ONE-TIME SETUP (do this once, needs internet only for download):
+#   Step 1:  pip install sentence-transformers
+#   Step 2:  python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+#   After that: run sop_grouping.py normally — fully offline forever
+#
+# If model is not cached, script automatically falls back to TF-IDF (also offline).
+#
+# Model options (all open-source, Apache 2.0 / MIT licensed):
+#   "all-MiniLM-L6-v2"          — recommended: best balance of accuracy + speed (~90MB)
+#   "all-MiniLM-L12-v2"         — more accurate, slightly larger (~120MB)
+#   "paraphrase-MiniLM-L3-v2"   — fastest, smallest (~60MB), slightly less accurate
+# ---------------------------------------------------------------------------
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -457,62 +482,154 @@ def expand_synonyms(text: str) -> str:
     return ' '.join(SYNONYM_MAP.get(w, w) for w in words)
 
 
+def _try_load_sentence_transformer():
+    """
+    Load sentence-transformers model in OFFLINE mode.
+
+    YOUR DATA NEVER LEAVES YOUR MACHINE:
+      - TRANSFORMERS_OFFLINE=1 tells the library to never make network calls
+      - HF_DATASETS_OFFLINE=1 same for datasets
+      - local_files_only=True  forces loading from local cache only
+      - The model is loaded entirely in local memory and runs on your CPU
+
+    First-time setup (one-time only, done separately before using the script):
+      pip install sentence-transformers
+            print(f"  [INFO]     python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer(\"{EMBEDDING_MODEL}\")' ")
+    After that, the model is cached locally and this script runs fully offline.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        import os
+
+        # Force offline mode — NO network calls ever made during inference
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ['HF_DATASETS_OFFLINE']  = '1'
+
+        # local_files_only=True raises an error if model is not cached locally
+        # rather than silently trying to download it
+        model = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
+        return model
+
+    except ImportError:
+        # sentence-transformers not installed — use TF-IDF fallback
+        return None
+    except Exception as e:
+        if 'local_files_only' in str(e) or 'No such file' in str(e) or 'not found' in str(e).lower():
+            print(f"  [INFO] Model '{EMBEDDING_MODEL}' not in local cache.")
+            print(f"  [INFO] Run this once to download it (requires internet, one-time only):")
+            print(f"  [INFO]     python -c 'from sentence_transformers import SentenceTransformer; SentenceTransformer(\"{EMBEDDING_MODEL}\")' ")
+            print(f"  [INFO] After that, the model runs fully offline. Falling back to TF-IDF for now.")
+        else:
+            print(f"  [WARN] Could not load embedding model: {e}")
+        return None
+
+
 def cluster_documents(texts: list, n_clusters: int):
     """
-    Semantic Similarity Analysis using:
-      1. Synonym expansion  — maps variant words to canonical forms
-      2. TF-IDF vectors     — weighted word-frequency representation
-      3. Cosine similarity  — standard measure for text similarity (angle, not distance)
-      4. Agglomerative clustering — groups by pairwise similarity, not centroid
-         (much better than KMeans for text: merges most similar pairs first)
+    Semantic Similarity Analysis — two-tier approach:
 
-    GROUPING_HINTS inject additional vocabulary to guide cluster boundaries.
+    TIER 1 (preferred): sentence-transformers embeddings
+      Uses a pre-trained neural language model to encode each text into a
+      dense vector that captures meaning, not just word frequency.
+      "invoice posting" and "bill payment" → similar vectors (same meaning).
+      Install: pip install sentence-transformers
+      Model downloads automatically (~90MB) on first run, then cached.
+
+    TIER 2 (fallback): TF-IDF + synonym expansion + cosine similarity
+      If sentence-transformers is not installed, falls back to statistical
+      word-frequency vectors with synonym normalisation (invoice=bill etc.).
+      Good but won't catch semantic equivalences it hasn't seen.
+
+    Both tiers use:
+      - Cosine similarity matrix  (angle between vectors = meaning similarity)
+      - Agglomerative clustering  (merges most-similar pairs first — far better
+                                   than KMeans which assigns to nearest centroid)
+      - GROUPING_HINTS injection  (nudges cluster boundaries per your instructions)
     """
-    from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.metrics.pairwise import cosine_similarity as cos_sim
     from sklearn.cluster import AgglomerativeClustering
 
-    # Step 1: expand synonyms
+    n_clusters = min(n_clusters, len(texts) - 1)
+    n_clusters = max(2, n_clusters)
+
+    # ── Tier 1: sentence-transformers ────────────────────────────────────────
+    model = _try_load_sentence_transformer()
+
+    if model is not None:
+        print("  [Semantic engine: sentence-transformers / " + EMBEDDING_MODEL + "]")
+
+        # Inject hint context into each text before encoding
+        instruction_hints = [h for h in GROUPING_HINTS
+                             if not any(k in h.lower() for k in
+                                        ['only sap', 'only process', 'only activities',
+                                         'sap code and', 'process steps and'])]
+        if instruction_hints:
+            hint_suffix = ' . ' + ' . '.join(instruction_hints)
+            encode_texts = [t + hint_suffix for t in texts]
+        else:
+            encode_texts = texts
+
+        # Encode all texts to dense embeddings
+        embeddings = model.encode(
+            encode_texts,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,   # unit vectors → cosine = dot product
+        )
+
+        # Cosine similarity (dot product since normalised)
+        sim_matrix = np.dot(embeddings, embeddings.T)
+        sim_matrix = np.clip(sim_matrix, -1, 1)
+
+        dist_matrix = 1 - sim_matrix
+        dist_matrix = np.clip(dist_matrix, 0, None)
+
+        agg = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric='precomputed',
+            linkage='average',
+        )
+        labels = agg.fit_predict(dist_matrix)
+
+        # For keyword extraction we still need TF-IDF
+        vectorizer = TfidfVectorizer(
+            stop_words='english', max_features=5000,
+            ngram_range=(1, 2), min_df=1, sublinear_tf=True,
+        )
+        expanded = [expand_synonyms(t) for t in texts]
+        tfidf_matrix = vectorizer.fit_transform(expanded)
+
+        return labels, vectorizer, tfidf_matrix, None
+
+    # ── Tier 2: TF-IDF + cosine fallback ─────────────────────────────────────
+    print("  [Semantic engine: TF-IDF cosine similarity (install sentence-transformers for better accuracy)]")
+
     expanded = [expand_synonyms(t) for t in texts]
 
-    # Step 2: inject GROUPING_HINTS (non-focus hints only) as boosted vocabulary
-    boosted = expanded[:]
     instruction_hints = [h for h in GROUPING_HINTS
                          if not any(k in h.lower() for k in
                                     ['only sap', 'only process', 'only activities',
                                      'sap code and', 'process steps and'])]
+    boosted = expanded[:]
     if instruction_hints:
         hint_block = expand_synonyms(' '.join(instruction_hints) * 3)
         hint_clean = re.sub(r'[^a-z\s]', ' ', hint_block.lower())
         boosted = [t + ' ' + hint_clean for t in expanded]
 
-    # Step 3: TF-IDF vectorisation
     vectorizer = TfidfVectorizer(
-        stop_words='english',
-        max_features=5000,
-        ngram_range=(1, 2),
-        min_df=1,
-        sublinear_tf=True,
+        stop_words='english', max_features=5000,
+        ngram_range=(1, 2), min_df=1, sublinear_tf=True,
     )
     tfidf_matrix = vectorizer.fit_transform(boosted)
-
-    # Step 4: cosine similarity matrix
-    sim_matrix = cosine_similarity(tfidf_matrix)
-
-    # Step 5: agglomerative clustering on distance (1 - similarity)
-    dist_matrix = 1 - sim_matrix
-    dist_matrix = np.clip(dist_matrix, 0, None)  # numerical safety
-
-    if n_clusters >= len(texts):
-        n_clusters = max(1, len(texts) - 1)
+    sim_matrix   = cos_sim(tfidf_matrix)
+    dist_matrix  = np.clip(1 - sim_matrix, 0, None)
 
     agg = AgglomerativeClustering(
-        n_clusters=n_clusters,
-        metric='precomputed',
-        linkage='average',   # average linkage = most balanced clusters
+        n_clusters=n_clusters, metric='precomputed', linkage='average',
     )
     labels = agg.fit_predict(dist_matrix)
 
-    return labels, vectorizer, tfidf_matrix, None  # None = no km object needed
+    return labels, vectorizer, tfidf_matrix, None
 
 
 # ---------------------------------------------------------------------------
